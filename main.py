@@ -17,8 +17,8 @@ import joblib
 tickers_bvc = ["ECOPETROL.CL", "ISA.CL", "GRUPOARGOS.CL", "GEB.CL"]
 FECHA_CORTE = "2023-12-31"  # El modelo NO verá nada después de esta fecha para entrenar
 features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
-# Estado = Features RF + Prediccion_RF + Has_Shares = 5 + 1 + 1 = 7 inputs
-state_dim = len(features_rf) + 2
+# Estado = Features RF + Prediccion_RF + Has_Shares + Unrealized_PNL = 5 + 1 + 1 + 1 = 8 inputs
+state_dim = len(features_rf) + 3
 action_dim = 3  # Hold, Buy, Sell
 
 tries = [50, 100]
@@ -175,6 +175,7 @@ class TradingEnvFast:
         self.shares_held = 0
         self.net_worth = initial_balance
         self.net_worth_history = [self.initial_balance]
+        self.avg_buy_price = 0.0
 
         # Datos en numpy para velocidad
         self.obs_data = self.df[self.features].values
@@ -188,6 +189,7 @@ class TradingEnvFast:
         self.shares_held = 0
         self.net_worth = self.initial_balance
         self.net_worth_history = [self.initial_balance]
+        self.avg_buy_price = 0.0
         return self._get_observation()
 
     def _get_observation(self):
@@ -206,10 +208,16 @@ class TradingEnvFast:
         # Podemos multiplicarlo por 10 o 100 para que tenga una escala similar a la normalización (que suele ir de -3 a 3)
         rf_pred_scaled = rf_pred * 100.0
 
+        # CALCULO DE PNL % (Profit and Loss no realizado)
+        current_price = self.prices[self.n_step]
+        unrealized_pnl = 0.0
+        if self.shares_held > 0 and self.avg_buy_price > 0:
+            unrealized_pnl = (current_price - self.avg_buy_price) / self.avg_buy_price
+
         has_shares = 1.0 if self.shares_held > 0 else 0.0
 
         # Concatenamos: [Features Normalizados] + [Prediccion RF] + [Tengo Acciones?]
-        extra_info = np.array([rf_pred_scaled, has_shares])
+        extra_info = np.array([rf_pred_scaled, has_shares, unrealized_pnl])
 
         state = np.concatenate((normalized_obs, extra_info))
 
@@ -221,15 +229,23 @@ class TradingEnvFast:
         # Ejecutar Acción
         if action == 1:  # BUY
             if self.balance >= current_price:
-                # Comprar todo lo posible (Simplificación agresiva para forzar movimientos)
                 shares_to_buy = self.balance // current_price
-                self.balance -= shares_to_buy * current_price
+
+                total_cost = shares_to_buy * current_price
+
+                current_value_held = self.shares_held * self.avg_buy_price
+                new_value = current_value_held + total_cost
                 self.shares_held += shares_to_buy
+                self.avg_buy_price = new_value / self.shares_held
+
+                self.balance -= total_cost
 
         elif action == 2:  # SELL
             if self.shares_held > 0:
                 self.balance += self.shares_held * current_price
                 self.shares_held = 0
+
+            self.avg_buy_price = 0.0
 
         # Avanzar el tiempo
         self.n_step += 1
@@ -248,17 +264,27 @@ class TradingEnvFast:
         # 2. Retorno del Mercado (Benchmark)
         market_return = (next_price - current_price) / current_price
 
-        # 3. Alpha (Diferencia)
-        # Multiplicamos por 100 para que los gradientes de la red neuronal sean significativos
+        # --- CÁLCULO DE RECOMPENSA MEJORADO ---
+
+        # 1. Recompensa Base (Alpha vs Mercado)
         reward = (agent_return - market_return) * 100
 
-        # 3. Penalización por inactividad extrema
-        # Si lleva mucho tiempo en cash y el mercado sube, castigamos más fuerte
-        if self.shares_held == 0 and market_return > 0:
-            reward -= 0.2
+        # 2. CASTIGO POR HOLDING EN BAJADA (Stop Loss implícito)
+        # Si tiene acciones y el precio bajó respecto a ayer, castigo extra
+        if self.shares_held > 0 and next_price < current_price:
+            reward -= 0.5
 
-        if agent_return < 0:
-            reward -= 1.0
+        # 3. PREMIO POR VENDER CON GANANCIA (Take Profit)
+        # Si vendió (action==2) y sacó ganancia respecto a su precio de compra
+        if action == 2 and self.shares_held == 0:  # Acaba de vender
+            # Calculamos retrospectivamente si fue buena venta
+            pnl_venta = (current_price - self.avg_buy_price) / self.avg_buy_price
+            if pnl_venta > 0.01:  # Si ganó más del 1%
+                reward += 2.0  # ¡Gran premio!
+
+        # 4. Castigo por inactividad si no tiene acciones y el mercado sube (FOMO)
+        if self.shares_held == 0 and market_return > 0.01:
+            reward -= 0.5
 
         done = self.n_step >= (self.max_steps - 1)
         next_state = (

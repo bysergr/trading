@@ -5,32 +5,19 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 from sklearn.ensemble import RandomForestRegressor
+import joblib  # Necesario para cargar el Scaler
+import os
 
 
-# --- 1. DEFINICIÓN DE ARQUITECTURA (Debe ser IDÉNTICA al entrenamiento) ---
+# --- 1. DEFINICIÓN DE ARQUITECTURA (IDÉNTICA al entrenamiento) ---
 class DQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DQN, self).__init__()
-        # Aumentamos neuronas a 128 para darle más capacidad
         self.fc1 = nn.Linear(input_dim, 128)
         self.fc2 = nn.Linear(128, 64)
         self.fc3 = nn.Linear(64, 32)
         self.fc4 = nn.Linear(32, output_dim)
-
-        # Usamos LeakyReLU en lugar de ReLU normal para evitar muerte neuronal
         self.leaky_relu = nn.LeakyReLU(0.01)
-
-        # Inicialización de pesos (Evita que empiece con sesgos tontos)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            # Inicialización He (Kaiming) optimizada para LeakyReLU
-            nn.init.kaiming_normal_(
-                module.weight, mode="fan_in", nonlinearity="leaky_relu"
-            )
-            if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
 
     def forward(self, x):
         x = self.leaky_relu(self.fc1(x))
@@ -44,18 +31,14 @@ class Agent:
         self.model = DQN(state_dim, action_dim)
 
     def act(self, state):
-        # En testeo, no usamos Epsilon (siempre la mejor decisión)
+        # En testeo, no usamos Epsilon (siempre la mejor decisión = argmax)
         with torch.no_grad():
             q_values = self.model(state)
         return torch.argmax(q_values).item()
 
     def load(self, filename):
-        if torch.cuda.is_available():
-            self.model.load_state_dict(torch.load(filename))
-        else:
-            self.model.load_state_dict(
-                torch.load(filename, map_location=torch.device("cpu"))
-            )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.load_state_dict(torch.load(filename, map_location=device))
         self.model.eval()
         print(f"✅ Modelo cargado exitosamente: {filename}")
 
@@ -78,6 +61,9 @@ def preparar_datos_test(ticker):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
+    if len(df) == 0:
+        raise ValueError(f"No se encontraron datos para {ticker}")
+
     # Features Técnicos
     df["Return_1d"] = df["Close"].pct_change()
     df["Return_5d"] = df["Close"].pct_change(5)
@@ -93,24 +79,45 @@ def preparar_datos_test(ticker):
 
 
 # --- 3. CONFIGURACIÓN ---
-TICKER = "GRUPOARGOS.CL"  # Cambia esto por la acción que quieras probar
-MODELO_FILE = "modelo_trader_alpha_50.pth"
-FECHA_INICIO_TEST = "2024-01-01"  # Probaremos desde 2024 hasta hoy (o 2025)
+TICKER = "ECOPETROL.CL"  # ¡Prueba con diferentes!
+MODELO_FILE = "modelo_dqn_v150.pth"  # Usa la versión que prefieras (v50, v100, etc.)
+SCALER_FILE = "scaler_trader.pkl"  # INDISPENSABLE
+FECHA_INICIO_TEST = "2024-01-01"  # Fecha desde donde empieza a simular
 
 # --- 4. EJECUCIÓN PRINCIPAL ---
+
+# Verificación de archivos
+if not os.path.exists(MODELO_FILE) or not os.path.exists(SCALER_FILE):
+    print("❌ ERROR: Faltan archivos.")
+    print(
+        f"Buscando Modelo: {MODELO_FILE} -> {'Encontrado' if os.path.exists(MODELO_FILE) else 'FALTA'}"
+    )
+    print(
+        f"Buscando Scaler: {SCALER_FILE} -> {'Encontrado' if os.path.exists(SCALER_FILE) else 'FALTA'}"
+    )
+    exit()
+
+# Cargar Scaler
+print("Loading Scaler...")
+scaler = joblib.load(SCALER_FILE)
 
 # A. Preparar datos
 df = preparar_datos_test(TICKER)
 features = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
 
 # B. Generar Señal Random Forest (Simulación del "Oráculo")
-# Entrenamos un RF rápido con datos PREVIOS a la fecha de test para no hacer trampa
 print("🌲 Generando señales del Random Forest auxiliar...")
+# Entrenamos solo con datos ANTERIORES al test para no hacer trampa
 mask_train = df.index < FECHA_INICIO_TEST
 mask_test = df.index >= FECHA_INICIO_TEST
 
 X_train_rf = df.loc[mask_train, features]
 y_train_rf = df.loc[mask_train, "Target_Return"]
+
+if len(X_train_rf) < 50:
+    print(
+        "⚠️ Advertencia: Pocos datos para entrenar el RF. El resultado puede ser inestable."
+    )
 
 rf_model = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
 rf_model.fit(X_train_rf, y_train_rf)
@@ -118,21 +125,17 @@ rf_model.fit(X_train_rf, y_train_rf)
 # Predecimos sobre el conjunto de TEST
 df_test = df.loc[mask_test].copy()
 if len(df_test) == 0:
-    raise ValueError(f"No hay datos para la fecha {FECHA_INICIO_TEST}")
+    print(
+        f"❌ Error: La fecha de inicio {FECHA_INICIO_TEST} es posterior a los datos disponibles."
+    )
+    exit()
 
 df_test["RF_Prediction"] = rf_model.predict(df_test[features])
 
 # C. Inicializar Agente y Cargar Modelo
 state_dim = len(features) + 2  # Features + RF_Pred + Has_Shares
 agent = Agent(state_dim, 3)
-
-try:
-    agent.load(MODELO_FILE)
-except FileNotFoundError:
-    print(
-        f"❌ Error: No encuentro el archivo '{MODELO_FILE}'. Asegúrate de haber entrenado primero."
-    )
-    exit()
+agent.load(MODELO_FILE)
 
 # D. Loop de Simulación (Backtesting)
 saldo = 10_000_000  # 10 Millones COP
@@ -145,72 +148,58 @@ puntos_venta = []
 print(f"\n🚀 Iniciando Test en {TICKER} desde {FECHA_INICIO_TEST}...")
 
 for i in range(len(df_test)):
-    # Construir estado
     row = df_test.iloc[i]
-    obs_tech = row[features].values.astype(float)
+
+    # 1. Obtener datos crudos
+    raw_obs = row[features].values.reshape(1, -1)
+
+    # 2. NORMALIZACIÓN CORRECTA (Usando el Scaler cargado)
+    obs_norm = scaler.transform(raw_obs)[0]
+
+    # 3. Preparar resto de inputs
     rf_pred = row["RF_Prediction"]
+    # IMPORTANTE: Usar el mismo multiplicador que en el entrenamiento (100.0)
+    rf_pred_scaled = rf_pred * 100.0
+
     has_shares = 1.0 if acciones > 0 else 0.0
 
-    obs_norm = obs_tech.copy()
-
-    # 2. Aplicamos las mismas reglas matemáticas
-    # Indices asumidos: [Return_1d, Return_5d, Dist_SMA_10, Volatility, RSI]
-
-    obs_norm[2] = obs_norm[2] - 1.0  # Dist_SMA: Centrar en 0
-    obs_norm[3] = obs_norm[3] / 1000.0  # Volatility: Escalar
-    obs_norm[4] = obs_norm[4] / 100.0  # RSI: Pasar de 0-100 a 0-1
-
-    rf_pred_norm = rf_pred * 10.0
-
-    state_input = np.concatenate((obs_norm, [rf_pred_norm, has_shares]))
-
-    if i % 50 == 0:
-        print(f"DEBUG INPUT DIA {i}: {state_input}")
-
+    # 4. Unir todo
+    state_input = np.concatenate((obs_norm, [rf_pred_scaled, has_shares]))
     state_tensor = torch.FloatTensor(state_input)
 
-    # El agente decide
+    # 5. El agente decide
     action = agent.act(state_tensor)
 
+    # Debug: Ver qué piensa la red neuronal
     with torch.no_grad():
         q_values = agent.model(state_tensor)
 
-    action = torch.argmax(q_values).item()
-
-    # SOLO PARA DEBUG: Imprimir los valores cada 20 días
-    if i % 20 == 0:
+    # Mostrar detalle cada 30 días
+    if i % 30 == 0:
         print(
-            f"Día {i} | Precios: {row['Close']:.0f} | Q-Values: HOLD={q_values[0]:.4f}, BUY={q_values[1]:.4f}, SELL={q_values[2]:.4f} -> Acción: {action}"
+            f"Día {i} | Q-Values: [Hold: {q_values[0]:.2f}, Buy: {q_values[1]:.2f}, Sell: {q_values[2]:.2f}] -> Acción: {action}"
         )
 
     precio_hoy = row["Close"]
     fecha = df_test.index[i]
 
     # Ejecutar Acción
-    tipo_accion = "MANTENER"
-
     if action == 1:  # COMPRAR
         if saldo >= precio_hoy:
             cantidad = saldo // precio_hoy
             costo = cantidad * precio_hoy
             saldo -= costo
             acciones += cantidad
-            tipo_accion = "COMPRA"
             puntos_compra.append((fecha, precio_hoy))
-            log_operaciones.append(
-                f"{fecha.date()} | COMPRA | Precio: ${precio_hoy:.2f} | Cant: {cantidad}"
-            )
+            log_operaciones.append(f"{fecha.date()} | COMPRA | ${precio_hoy:.0f}")
 
     elif action == 2:  # VENDER
         if acciones > 0:
             ingreso = acciones * precio_hoy
             saldo += ingreso
             acciones = 0
-            tipo_accion = "VENTA"
             puntos_venta.append((fecha, precio_hoy))
-            log_operaciones.append(
-                f"{fecha.date()} | VENTA  | Precio: ${precio_hoy:.2f} | Total: ${ingreso:.2f}"
-            )
+            log_operaciones.append(f"{fecha.date()} | VENTA  | ${precio_hoy:.0f}")
 
     # Valor total portafolio
     valor_total = saldo + (acciones * precio_hoy)
@@ -226,24 +215,17 @@ bh_retorno = (
 print("\n" + "=" * 40)
 print(f"RESULTADO FINAL ({TICKER})")
 print("=" * 40)
-print(f"Saldo Inicial: $10,000,000")
+print("Saldo Inicial: $10,000,000")
 print(f"Saldo Final:   ${historial_valor[-1]:,.2f}")
-print(f"Rentabilidad Modelo: {retorno_total:.2f}%")
-print(f"Rentabilidad Mercado (Buy&Hold): {bh_retorno:.2f}%")
+print(f"Rentabilidad IA:      {retorno_total:.2f}%")
+print(f"Rentabilidad Mercado: {bh_retorno:.2f}%")
 print("=" * 40)
-
-# Mostrar últimos 5 logs
-print("\n--- Últimas 5 Operaciones ---")
-for log in log_operaciones[-5:]:
-    print(log)
 
 # Gráfica
 fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
 
 # Gráfico 1: Precio y Señales
-ax1.plot(
-    df_test.index, df_test["Close"], label="Precio Acción", color="gray", alpha=0.5
-)
+ax1.plot(df_test.index, df_test["Close"], label="Precio", color="gray", alpha=0.5)
 if puntos_compra:
     idx_b, prices_b = zip(*puntos_compra)
     ax1.scatter(
@@ -254,32 +236,25 @@ if puntos_venta:
     ax1.scatter(
         idx_s, prices_s, marker="v", color="red", s=100, label="Venta", zorder=5
     )
-ax1.set_title(f"{TICKER} - Decisiones de Compra/Venta")
-ax1.set_ylabel("Precio (COP)")
+ax1.set_title(f"{TICKER} - Operaciones del Agente")
 ax1.legend()
 ax1.grid(True, alpha=0.3)
 
 # Gráfico 2: Evolución del Portafolio
 ax2.plot(
-    df_test.index,
-    historial_valor,
-    label="Mi Portafolio (IA)",
-    color="blue",
-    linewidth=2,
+    df_test.index, historial_valor, label="IA Portafolio", color="blue", linewidth=2
 )
-# Comparativa con Buy & Hold (normalizado al capital inicial)
 factor_norm = 10_000_000 / df_test["Close"].iloc[0]
 ax2.plot(
     df_test.index,
     df_test["Close"] * factor_norm,
-    label="Mercado (Buy & Hold)",
+    label="Buy & Hold",
     color="orange",
     linestyle="--",
     alpha=0.7,
 )
 
-ax2.set_title(f"Evolución del Capital (Rentabilidad: {retorno_total:.2f}%)")
-ax2.set_ylabel("Valor Portafolio (COP)")
+ax2.set_title(f"Rentabilidad Acumulada: {retorno_total:.2f}%")
 ax2.legend()
 ax2.grid(True, alpha=0.3)
 

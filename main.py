@@ -302,92 +302,89 @@ features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
 state_dim = len(features_rf) + 2
 action_dim = 3  # Hold, Buy, Sell
 
-agent = Agent(state_dim, action_dim)
-episodes = 200  # Aumentar para mejor resultado (ej. 200)
+tries = [1, 2, 100]
+for tr in tries:
+    agent = Agent(state_dim, action_dim)
+    episodes = tr  # Aumentar para mejor resultado (ej. 200)
 
-print(f"\n--- Iniciando Entrenamiento DQN (Episodios: {episodes}) ---")
-loss_history = []
+    print(f"\n--- Iniciando Entrenamiento DQN (Episodios: {episodes}) ---")
+    loss_history = []
 
-for e in range(episodes):
-    print("Episode: ", e)
-    # Elegimos una acción aleatoria para entrenar en este episodio (Generalización)
-    ticker_train = random.choice(list(market_data_opt.keys()))
-    df_train = market_data_opt[ticker_train]  # Usamos el diccionario optimizado
+    for e in range(episodes):
+        print("Episode: ", e)
+        # Elegimos una acción aleatoria para entrenar en este episodio (Generalización)
+        ticker_train = random.choice(list(market_data_opt.keys()))
+        df_train = market_data_opt[ticker_train]  # Usamos el diccionario optimizado
 
-    df_train_cut = df_train[df_train.index <= FECHA_CORTE]
-    if len(df_train_cut) < 50:
-        continue
+        df_train_cut = df_train[df_train.index <= FECHA_CORTE]
+        if len(df_train_cut) < 50:
+            continue
 
-    # YA NO PASAMOS EL MODELO RF, SOLO LOS DATOS
-    env = TradingEnvFast(df_train_cut, features_rf)
-    state = env.reset()
+        # YA NO PASAMOS EL MODELO RF, SOLO LOS DATOS
+        env = TradingEnvFast(df_train_cut, features_rf)
+        state = env.reset()
 
-    total_reward = 0
-    done = False
+        total_reward = 0
+        done = False
 
-    with tqdm(
-        total=env.max_steps,
-        desc=f"Episodio {e + 1}/{episodes} ({ticker_train})",
-        unit="días",
-    ) as pbar:
-        while not done:
-            action = agent.act(state, is_training=True)
-            next_state, reward, done = env.step(action)
-            agent.remember(state, action, reward, next_state, done)
-            state = next_state
-            total_reward += reward
+        with tqdm(
+            total=env.max_steps,
+            desc=f"Episodio {e + 1}/{episodes} ({ticker_train})",
+            unit="días",
+        ) as pbar:
+            while not done:
+                action = agent.act(state, is_training=True)
+                next_state, reward, done = env.step(action)
+                agent.remember(state, action, reward, next_state, done)
+                state = next_state
+                total_reward += reward
 
-            loss = agent.replay()
+                loss = agent.replay()
 
-            pbar.update(1)
+                pbar.update(1)
 
-            # Muestra el Profit acumulado y el Epsilon actual
-            pbar.set_postfix(
-                {"Profit": f"{total_reward:.1f}%", "Eps": f"{agent.epsilon:.2f}"}
+                # Muestra el Profit acumulado y el Epsilon actual
+                pbar.set_postfix(
+                    {"Profit": f"{total_reward:.1f}%", "Eps": f"{agent.epsilon:.2f}"}
+                )
+
+        if e % 5 == 0:
+            agent.update_target_network()
+            print(
+                f"Episodio {e}/{episodes} | Ticker: {ticker_train} | Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.2f}"
             )
 
-    if e % 5 == 0:
-        agent.update_target_network()
-        print(
-            f"Episodio {e}/{episodes} | Ticker: {ticker_train} | Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.2f}"
-        )
+    print("\nEntrenamiento finalizado.")
 
+    def enviar_a_telegram(archivo_path, token, chat_id):
+        url = f"https://api.telegram.org/bot{token}/sendDocument"
 
-print("\nEntrenamiento finalizado.")
+        print("📤 Subiendo modelo a Telegram...")
+        try:
+            with open(archivo_path, "rb") as f:
+                files = {"document": f}
+                data = {
+                    "chat_id": chat_id,
+                    "caption": "🚀 Entrenamiento finalizado. Aquí está tu modelo.",
+                }
+                response = requests.post(url, files=files, data=data)
 
+            if response.status_code == 200:
+                print("✅ ¡Modelo enviado a tu celular!")
+            else:
+                print(f"❌ Error al enviar: {response.text}")
+        except Exception as e:
+            print(f"Error: {e}")
 
-def enviar_a_telegram(archivo_path, token, chat_id):
-    url = f"https://api.telegram.org/bot{token}/sendDocument"
-
-    print("📤 Subiendo modelo a Telegram...")
     try:
-        with open(archivo_path, "rb") as f:
-            files = {"document": f}
-            data = {
-                "chat_id": chat_id,
-                "caption": "🚀 Entrenamiento finalizado. Aquí está tu modelo.",
-            }
-            response = requests.post(url, files=files, data=data)
+        agent.save(f"modelo_trader_{tr}.pth")
 
-        if response.status_code == 200:
-            print("✅ ¡Modelo enviado a tu celular!")
-        else:
-            print(f"❌ Error al enviar: {response.text}")
+        # --- USAR AL FINAL DEL ENTRENAMIENTO ---
+        TOKEN = "8208409663:AAFgU_1DsRBan3lpBu4YcGx_50uqx0GiSEo"  # Pega lo que te dio BotFather
+        CHAT_ID = "6912858224"  # Pega tu ID numérico
+
+        enviar_a_telegram(f"modelo_trader_{tr}.pth", TOKEN, CHAT_ID)
     except Exception as e:
         print(f"Error: {e}")
-
-
-try:
-    agent.save("modelo_trader.pth")
-
-    # --- USAR AL FINAL DEL ENTRENAMIENTO ---
-    TOKEN = (
-        "8208409663:AAFgU_1DsRBan3lpBu4YcGx_50uqx0GiSEo"  # Pega lo que te dio BotFather
-    )
-    CHAT_ID = "6912858224"  # Pega tu ID numérico
-
-    enviar_a_telegram("modelo_trader.pth", TOKEN, CHAT_ID)
-except Exception as e:
-    print(f"Error: {e}")
-finally:
-    print("Modelo enviado exitosamente en: modelo_trader.pth")
+    finally:
+        print(f"Modelo enviado exitosamente en: modelo_trader_{tr}.pth")

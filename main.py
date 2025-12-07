@@ -8,6 +8,8 @@ import torch.optim as optim
 import random
 from collections import deque
 from tqdm import tqdm
+import requests
+
 
 # --- CONFIGURACIÓN ---
 tickers_bvc = ["ECOPETROL.CL", "ISA.CL", "GRUPOARGOS.CL", "GEB.CL"]
@@ -352,4 +354,40 @@ for e in range(episodes):
 
 
 print("\nEntrenamiento finalizado.")
-agent.save("modelo_trader.pth")
+
+
+def enviar_a_telegram(archivo_path, token, chat_id):
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+
+    print("📤 Subiendo modelo a Telegram...")
+    try:
+        with open(archivo_path, "rb") as f:
+            files = {"document": f}
+            data = {
+                "chat_id": chat_id,
+                "caption": "🚀 Entrenamiento finalizado. Aquí está tu modelo.",
+            }
+            response = requests.post(url, files=files, data=data)
+
+        if response.status_code == 200:
+            print("✅ ¡Modelo enviado a tu celular!")
+        else:
+            print(f"❌ Error al enviar: {response.text}")
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+try:
+    agent.save("modelo_trader.pth")
+
+    # --- USAR AL FINAL DEL ENTRENAMIENTO ---
+    TOKEN = (
+        "8208409663:AAFgU_1DsRBan3lpBu4YcGx_50uqx0GiSEo"  # Pega lo que te dio BotFather
+    )
+    CHAT_ID = "6912858224"  # Pega tu ID numérico
+
+    enviar_a_telegram("modelo_trader.pth", TOKEN, CHAT_ID)
+except Exception as e:
+    print(f"Error: {e}")
+finally:
+    print("Modelo enviado exitosamente en: modelo_trader.pth")

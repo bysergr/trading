@@ -302,7 +302,7 @@ features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
 state_dim = len(features_rf) + 2
 action_dim = 3  # Hold, Buy, Sell
 
-tries = [1, 2, 100]
+tries = [200, 150, 100, 300]
 for tr in tries:
     agent = Agent(state_dim, action_dim)
     episodes = tr  # Aumentar para mejor resultado (ej. 200)

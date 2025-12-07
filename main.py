@@ -2,6 +2,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,11 +10,18 @@ import random
 from collections import deque
 from tqdm import tqdm
 import requests
+import joblib
 
 
 # --- CONFIGURACIÓN ---
 tickers_bvc = ["ECOPETROL.CL", "ISA.CL", "GRUPOARGOS.CL", "GEB.CL"]
 FECHA_CORTE = "2023-12-31"  # El modelo NO verá nada después de esta fecha para entrenar
+features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
+# Estado = Features RF + Prediccion_RF + Has_Shares = 5 + 1 + 1 = 7 inputs
+state_dim = len(features_rf) + 2
+action_dim = 3  # Hold, Buy, Sell
+
+tries = [50, 100]
 
 
 # --- FUNCIONES (Mismas del modelo avanzado) ---
@@ -60,13 +68,10 @@ for t in tickers_bvc:
 
         df_processed = preparar_datos(dfabi)
 
-        features = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
-
-        # --- AQUÍ ESTÁ EL CAMBIO CLAVE: CORTE POR FECHA ---
         # Máscaras booleanas para separar el tiempo
         mask_train = df_processed.index <= FECHA_CORTE
 
-        X_train = df_processed.loc[mask_train, features]
+        X_train = df_processed.loc[mask_train, features_rf]
         y_train = df_processed.loc[mask_train, "Target_Return"]
 
         print(f"   -> Datos Entrenamiento (Hasta 2024): {len(X_train)} días")
@@ -121,15 +126,48 @@ for t, model in rd_models.items():
 
     market_data_opt[t] = df
 
+
+print("\n--- Calibrando Normalizador (StandardScaler) ---")
+
+scaler = StandardScaler()
+all_training_data = []
+
+# 1. Recolectamos TODOS los datos de entrenamiento de todos los tickers
+for t in tickers_bvc:
+    df = market_data_opt[t]
+
+    # IMPORTANTE: Solo "aprendemos" de los datos anteriores a la fecha de corte
+    # para evitar "Data Leakage" (que el modelo vea el futuro)
+    df_train_cut = df[df.index <= FECHA_CORTE]
+
+    # Extraemos solo las columnas numéricas que usa la red neuronal
+    # features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
+    if len(df_train_cut) > 0:
+        all_training_data.append(df_train_cut[features_rf].values)
+
+# 2. Unimos todo en una matriz gigante
+full_matrix = np.concatenate(all_training_data, axis=0)
+
+# 3. El Scaler calcula la Media y Desviación Estándar de todo el mercado
+scaler.fit(full_matrix)
+
+print("Scaler calibrado exitosamente.")
+print(f"Media de cada feature: {scaler.mean_}")
+print(f"Varianza de cada feature: {scaler.var_}")
+
+# Guardamos el scaler para usarlo luego en producción (Telegram/Live Trading)
+joblib.dump(scaler, "scaler_trader.pkl")
+
 print(
     "Datos optimizados. El entorno RL ahora solo leerá columnas, no ejecutará modelos."
 )
 
 
 class TradingEnvFast:
-    def __init__(self, df, features_list, initial_balance=10_000_000):
+    def __init__(self, df, features_list, scaler, initial_balance=10_000_000):
         self.df = df
         self.features = features_list
+        self.scaler = scaler
         self.initial_balance = initial_balance
 
         self.n_step = 0
@@ -153,33 +191,27 @@ class TradingEnvFast:
         return self._get_observation()
 
     def _get_observation(self):
-        # 1. Obtenemos los features técnicos originales
-        obs = self.obs_data[self.n_step].copy()
+        # 1. Obtenemos los features crudos (raw)
+        raw_obs = self.obs_data[self.n_step].copy()
+
+        # 2. --- NORMALIZACIÓN PROFESIONAL ---
+        # El scaler espera una matriz 2D (1 fila, N columnas), por eso el reshape(1, -1)
+        # transform devuelve una matriz, así que tomamos el índice [0] para volver a tener un vector
+        normalized_obs = self.scaler.transform(raw_obs.reshape(1, -1))[0]
+
+        # 3. Obtenemos la predicción del RF
         rf_pred = self.rf_preds[self.n_step]
 
-        # --- NORMALIZACIÓN DE INPUTS (CRÍTICO PARA QUE APRENDA) ---
-        # Asumimos orden: [Return_1d, Return_5d, Dist_SMA_10, Volatility, RSI]
-
-        # RSI (0-100) -> Lo pasamos a (0-1)
-        # Si RSI es la última columna (indice -1 o 4)
-        obs[-1] = obs[-1] / 100.0
-
-        # Distancia SMA (ej. 1.05) -> Centramos en 0 (ej. 0.05)
-        # Si es la columna 2
-        obs[2] = obs[2] - 1.0
-
-        # Volatilidad (ej. 50 pesos) -> Es difícil normalizar sin contexto,
-        # pero podemos dividir por el precio actual aproximado o usar log.
-        # Por ahora, una división simple por 1000 ayuda a que no explote.
-        obs[3] = obs[3] / 1000.0
-
-        # RF Prediction es pequeño, lo amplificamos un poco para que la red lo "vea" bien
-        rf_pred = rf_pred * 10.0
+        # La predicción del RF suele ser un % pequeño (ej: 0.01).
+        # Podemos multiplicarlo por 10 o 100 para que tenga una escala similar a la normalización (que suele ir de -3 a 3)
+        rf_pred_scaled = rf_pred * 100.0
 
         has_shares = 1.0 if self.shares_held > 0 else 0.0
 
-        extra_info = np.array([rf_pred, has_shares])
-        state = np.concatenate((obs, extra_info))
+        # Concatenamos: [Features Normalizados] + [Prediccion RF] + [Tengo Acciones?]
+        extra_info = np.array([rf_pred_scaled, has_shares])
+
+        state = np.concatenate((normalized_obs, extra_info))
 
         return torch.FloatTensor(state)
 
@@ -220,6 +252,14 @@ class TradingEnvFast:
         # Multiplicamos por 100 para que los gradientes de la red neuronal sean significativos
         reward = (agent_return - market_return) * 100
 
+        # 3. Penalización por inactividad extrema
+        # Si lleva mucho tiempo en cash y el mercado sube, castigamos más fuerte
+        if self.shares_held == 0 and market_return > 0:
+            reward -= 0.2
+
+        if agent_return < 0:
+            reward -= 1.0
+
         done = self.n_step >= (self.max_steps - 1)
         next_state = (
             self._get_observation()
@@ -230,18 +270,32 @@ class TradingEnvFast:
         return next_state, reward, done
 
 
+# --- CLASES DEL AGENTE Y ENTORNO ---
+
+
 class DQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, output_dim)
-        self.relu = nn.ReLU()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, output_dim)
+        self.leaky_relu = nn.LeakyReLU(0.01)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.kaiming_normal_(
+                module.weight, mode="fan_in", nonlinearity="leaky_relu"
+            )
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
 
     def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        return self.fc3(x)
+        x = self.leaky_relu(self.fc1(x))
+        x = self.leaky_relu(self.fc2(x))
+        x = self.leaky_relu(self.fc3(x))
+        return self.fc4(x)
 
 
 class Agent:
@@ -250,19 +304,19 @@ class Agent:
         self.target_model = DQN(state_dim, action_dim)
         self.target_model.load_state_dict(self.model.state_dict())
 
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.0001)
         self.loss_fn = nn.MSELoss()
         self.memory = deque(maxlen=2000)
 
-        self.epsilon = 1.0  # Exploración inicial
-        self.epsilon_min = 0.1  # Aumentado para mantener más exploración
-        self.epsilon_decay = 0.998  # Más lento para mantener exploración más tiempo
-        self.gamma = 0.95  # Factor de descuento
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.epsilon_decay = 0.98
+        self.gamma = 0.95
         self.batch_size = 32
 
     def act(self, state, is_training=True):
         if is_training and np.random.rand() <= self.epsilon:
-            return random.randrange(3)  # Acción aleatoria
+            return random.randrange(3)
         with torch.no_grad():
             q_values = self.model(state)
         return torch.argmax(q_values).item()
@@ -276,93 +330,118 @@ class Agent:
 
         minibatch = random.sample(self.memory, self.batch_size)
 
-        total_loss = 0
-        for state, action, reward, next_state, done in minibatch:
-            target = reward
-            if not done:
-                target = (
-                    reward
-                    + self.gamma * torch.max(self.target_model(next_state)).item()
-                )
+        # Vectorización (Mucho más rápido)
+        states = torch.cat([s.unsqueeze(0) for s, a, r, n, d in minibatch])
+        actions = torch.tensor([a for s, a, r, n, d in minibatch]).unsqueeze(1)
+        rewards = torch.tensor([r for s, a, r, n, d in minibatch], dtype=torch.float32)
+        next_states = torch.cat([n.unsqueeze(0) for s, a, r, n, d in minibatch])
+        dones = torch.tensor([d for s, a, r, n, d in minibatch], dtype=torch.float32)
 
-            target_f = self.model(state)
+        q_values = self.model(states).gather(1, actions).squeeze(1)
 
-            # Actualizamos solo el Q-value de la acción tomada
-            # Convertimos action a tensor para indexar si fuera necesario, aqui lo hacemos manual:
-            target_vector = target_f.tolist()
-            target_vector[action] = target
+        with torch.no_grad():
+            next_q_values = self.target_model(next_states).max(1)[0]
+            expected_q_values = rewards + (self.gamma * next_q_values * (1 - dones))
 
-            # Recalculamos loss y optimizamos
-            prediction = self.model(state)
-            target_tensor = torch.FloatTensor(target_vector)
+        loss = self.loss_fn(q_values, expected_q_values)
 
-            loss = self.loss_fn(prediction, target_tensor)
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            total_loss += loss.item()
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
 
-        # NO reducimos epsilon aquí - lo haremos al final de cada episodio
-        # Esto evita que el epsilon caiga demasiado rápido
-
-        return total_loss / self.batch_size
+        return loss.item()
 
     def decay_epsilon(self):
-        """Reduce epsilon al final de cada episodio"""
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
     def update_target_network(self):
         self.target_model.load_state_dict(self.model.state_dict())
 
-    def save(self, filename="modelo_dqn.pth"):
+    def save(self, filename):
         torch.save(self.model.state_dict(), filename)
-        print(f"Modelo guardado exitosamente en: {filename}")
-
-    def load(self, filename="modelo_dqn.pth"):
-        # map_location='cpu' asegura que funcione aunque no tengas GPU
-        self.model.load_state_dict(
-            torch.load(filename, map_location=torch.device("cpu"))
-        )
-        self.model.eval()  # Pone el modelo en modo 'evaluación' (fija los pesos)
-        print(f"Modelo cargado desde: {filename}")
 
 
-# --- CONFIGURACIÓN DE ENTRENAMIENTO ---
-features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
-# Estado = Features RF + Prediccion_RF + Has_Shares = 5 + 1 + 1 = 7 inputs
-state_dim = len(features_rf) + 2
-action_dim = 3  # Hold, Buy, Sell
+# --- LÓGICA DE ENTRENAMIENTO INCREMENTAL ---
 
-tries = [50, 100]
-for tr in tries:
-    agent = Agent(state_dim, action_dim)
-    episodes = tr  # Aumentar para mejor resultado (ej. 200)
+# 1. Definimos las metas acumulativas
+# El modelo entrenará hasta llegar al 50, parará, enviará, y seguirá hasta el 100, etc.
+metas_episodios = [50, 100, 150, 200]
 
-    print(f"\n--- Iniciando Entrenamiento DQN (Episodios: {episodes}) ---")
-    loss_history = []
+# 2. Inicializamos el agente UNA SOLA VEZ fuera del bucle
+print("\n--- Inicializando Agente (Cerebro Nuevo) ---")
+agent = Agent(state_dim, action_dim)
 
-    for e in range(episodes):
-        print("Episode: ", e)
-        # Elegimos una acción aleatoria para entrenar en este episodio (Generalización)
+# Variable para llevar la cuenta de dónde vamos
+episodios_completados = 0
+
+
+# Función de Telegram
+def enviar_a_telegram(archivo_path, token, chat_id, descripcion):
+    url = f"https://api.telegram.org/bot{token}/sendDocument"
+    print(f"📤 Subiendo {archivo_path} a Telegram...")
+    try:
+        with open(archivo_path, "rb") as f:
+            files = {"document": f}
+            data = {"chat_id": chat_id, "caption": descripcion}
+            requests.post(url, files=files, data=data)
+            print("✅ Enviado.")
+    except Exception as e:
+        print(f"❌ Error al enviar: {e}")
+
+
+# Credenciales (Pon las tuyas aquí)
+TOKEN = "8208409663:AAFgU_1DsRBan3lpBu4YcGx_50uqx0GiSEo"
+CHAT_ID = "6912858224"
+
+# Primero enviamos el Scaler una sola vez (es necesario para usar cualquier versión del modelo)
+try:
+    enviar_a_telegram(
+        "scaler_trader.pkl",
+        TOKEN,
+        CHAT_ID,
+        "👓 Gafas (Scaler) - Único para todas las versiones",
+    )
+except Exception as e:
+    print(f"Error al enviar el Scaler: {e}")
+    print("Asegurate de haber ejecutado la parte del Scaler primero.")
+
+
+# 3. Bucle de Metas
+for meta in metas_episodios:
+    # Calculamos cuántos faltan para la siguiente meta
+    episodios_a_entrenar = meta - episodios_completados
+
+    if episodios_a_entrenar <= 0:
+        continue  # Ya pasamos esa meta
+
+    print(
+        f"\n>>> Entrenando desde episodio {episodios_completados} hasta {meta} ({episodios_a_entrenar} nuevos) <<<"
+    )
+
+    for e in range(episodios_a_entrenar):
+        num_episodio_global = episodios_completados + e + 1
+
+        # Selección de datos
         ticker_train = random.choice(list(market_data_opt.keys()))
-        df_train = market_data_opt[ticker_train]  # Usamos el diccionario optimizado
-
+        df_train = market_data_opt[ticker_train]
         df_train_cut = df_train[df_train.index <= FECHA_CORTE]
+
         if len(df_train_cut) < 50:
             continue
 
-        # YA NO PASAMOS EL MODELO RF, SOLO LOS DATOS
-        env = TradingEnvFast(df_train_cut, features_rf)
+        # Creamos entorno con el Scaler
+        env = TradingEnvFast(df_train_cut, features_rf, scaler)
         state = env.reset()
 
         total_reward = 0
         done = False
-        action_counts = {0: 0, 1: 0, 2: 0}  # Para monitorear acciones
+        action_counts = {0: 0, 1: 0, 2: 0}
 
         with tqdm(
             total=env.max_steps,
-            desc=f"Episodio {e + 1}/{episodes} ({ticker_train})",
+            desc=f"Episodio Global {num_episodio_global}/{meta}",
             unit="días",
         ) as pbar:
             while not done:
@@ -372,60 +451,27 @@ for tr in tries:
                 agent.remember(state, action, reward, next_state, done)
                 state = next_state
                 total_reward += reward
-
-                loss = agent.replay()
-
+                agent.replay()
                 pbar.update(1)
-
-                # Muestra el Profit acumulado, Epsilon y distribución de acciones
                 pbar.set_postfix(
-                    {
-                        "Profit": f"{total_reward:.1f}%",
-                        "Eps": f"{agent.epsilon:.2f}",
-                        "Actions": f"H:{action_counts[0]} B:{action_counts[1]} S:{action_counts[2]}",
-                    }
+                    {"Profit": f"{total_reward:.1f}%", "Eps": f"{agent.epsilon:.2f}"}
                 )
 
-        # Reducir epsilon al final del episodio (no en cada batch)
         agent.decay_epsilon()
 
-        if e % 5 == 0:
+        # Actualizar red objetivo cada 5 episodios
+        if num_episodio_global % 5 == 0:
             agent.update_target_network()
-            print(
-                f"Episodio {e}/{episodes} | Ticker: {ticker_train} | Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.2f} | Acciones: HOLD={action_counts[0]}, BUY={action_counts[1]}, SELL={action_counts[2]}"
-            )
 
-    print("\nEntrenamiento finalizado.")
+    # --- AL FINALIZAR LA META ---
+    episodios_completados = meta  # Actualizamos el contador
 
-    def enviar_a_telegram(archivo_path, token, chat_id):
-        url = f"https://api.telegram.org/bot{token}/sendDocument"
+    # Guardamos esta versión
+    nombre_modelo = f"modelo_dqn_v{meta}.pth"
+    agent.save(nombre_modelo)
 
-        print("📤 Subiendo modelo a Telegram...")
-        try:
-            with open(archivo_path, "rb") as f:
-                files = {"document": f}
-                data = {
-                    "chat_id": chat_id,
-                    "caption": "🚀 Entrenamiento finalizado. Aquí está tu modelo.",
-                }
-                response = requests.post(url, files=files, data=data)
+    # Enviamos a Telegram
+    mensaje = f"🚀 Checkpoint alcanzado: {meta} Episodios.\nEpsilon actual: {agent.epsilon:.3f}"
+    enviar_a_telegram(nombre_modelo, TOKEN, CHAT_ID, mensaje)
 
-            if response.status_code == 200:
-                print("✅ ¡Modelo enviado a tu celular!")
-            else:
-                print(f"❌ Error al enviar: {response.text}")
-        except Exception as e:
-            print(f"Error: {e}")
-
-    try:
-        agent.save(f"modelo_trader_alpha_{tr}.pth")
-
-        # --- USAR AL FINAL DEL ENTRENAMIENTO ---
-        TOKEN = "8208409663:AAFgU_1DsRBan3lpBu4YcGx_50uqx0GiSEo"  # Pega lo que te dio BotFather
-        CHAT_ID = "6912858224"  # Pega tu ID numérico
-
-        enviar_a_telegram(f"modelo_trader_alpha_{tr}.pth", TOKEN, CHAT_ID)
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        print(f"Modelo enviado exitosamente en: modelo_trader_alpha_{tr}.pth")
+print("\n🏁 Entrenamiento completo de todas las fases.")

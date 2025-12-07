@@ -11,15 +11,32 @@ from sklearn.ensemble import RandomForestRegressor
 class DQN(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(DQN, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, output_dim)
-        self.relu = nn.ReLU()
+        # Aumentamos neuronas a 128 para darle más capacidad
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, 32)
+        self.fc4 = nn.Linear(32, output_dim)
+
+        # Usamos LeakyReLU en lugar de ReLU normal para evitar muerte neuronal
+        self.leaky_relu = nn.LeakyReLU(0.01)
+
+        # Inicialización de pesos (Evita que empiece con sesgos tontos)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            # Inicialización He (Kaiming) optimizada para LeakyReLU
+            nn.init.kaiming_normal_(
+                module.weight, mode="fan_in", nonlinearity="leaky_relu"
+            )
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
 
     def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        return self.fc3(x)
+        x = self.leaky_relu(self.fc1(x))
+        x = self.leaky_relu(self.fc2(x))
+        x = self.leaky_relu(self.fc3(x))
+        return self.fc4(x)
 
 
 class Agent:
@@ -134,12 +151,37 @@ for i in range(len(df_test)):
     rf_pred = row["RF_Prediction"]
     has_shares = 1.0 if acciones > 0 else 0.0
 
-    state_input = np.concatenate((obs_tech, [rf_pred, has_shares]))
+    obs_norm = obs_tech.copy()
+
+    # 2. Aplicamos las mismas reglas matemáticas
+    # Indices asumidos: [Return_1d, Return_5d, Dist_SMA_10, Volatility, RSI]
+
+    obs_norm[2] = obs_norm[2] - 1.0  # Dist_SMA: Centrar en 0
+    obs_norm[3] = obs_norm[3] / 1000.0  # Volatility: Escalar
+    obs_norm[4] = obs_norm[4] / 100.0  # RSI: Pasar de 0-100 a 0-1
+
+    rf_pred_norm = rf_pred * 10.0
+
+    state_input = np.concatenate((obs_norm, [rf_pred_norm, has_shares]))
+
+    if i % 50 == 0:
+        print(f"DEBUG INPUT DIA {i}: {state_input}")
+
     state_tensor = torch.FloatTensor(state_input)
 
     # El agente decide
     action = agent.act(state_tensor)
-    print(f"Action: {action}")
+
+    with torch.no_grad():
+        q_values = agent.model(state_tensor)
+
+    action = torch.argmax(q_values).item()
+
+    # SOLO PARA DEBUG: Imprimir los valores cada 20 días
+    if i % 20 == 0:
+        print(
+            f"Día {i} | Precios: {row['Close']:.0f} | Q-Values: HOLD={q_values[0]:.4f}, BUY={q_values[1]:.4f}, SELL={q_values[2]:.4f} -> Acción: {action}"
+        )
 
     precio_hoy = row["Close"]
     fecha = df_test.index[i]

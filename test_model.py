@@ -76,8 +76,8 @@ def preparar_datos_test(ticker):
 
 
 # --- 3. CONFIGURACIÓN ---
-TICKER = "ECOPETROL.CL"  # Cambia esto por la acción que quieras probar
-MODELO_FILE = "modelo_trader.pth"
+TICKER = "GRUPOARGOS.CL"  # Cambia esto por la acción que quieras probar
+MODELO_FILE = "modelo_trader_alpha_50.pth"
 FECHA_INICIO_TEST = "2024-01-01"  # Probaremos desde 2024 hasta hoy (o 2025)
 
 # --- 4. EJECUCIÓN PRINCIPAL ---
@@ -139,6 +139,7 @@ for i in range(len(df_test)):
 
     # El agente decide
     action = agent.act(state_tensor)
+    print(f"Action: {action}")
 
     precio_hoy = row["Close"]
     fecha = df_test.index[i]

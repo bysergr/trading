@@ -129,7 +129,6 @@ print(
 class TradingEnvFast:
     def __init__(self, df, features_list, initial_balance=10_000_000):
         self.df = df
-        # Ya no necesitamos model_rf aquí
         self.features = features_list
         self.initial_balance = initial_balance
 
@@ -139,13 +138,10 @@ class TradingEnvFast:
         self.net_worth = initial_balance
         self.net_worth_history = [self.initial_balance]
 
-        # Convertimos el DataFrame a numpy array al inicio para velocidad máxima
-        # Esto evita usar .iloc (que es lento) dentro del bucle
-        # El orden de columnas será: [Features... , RF_Prediction, Close, Target_Return]
+        # Datos en numpy para velocidad
         self.obs_data = self.df[self.features].values
         self.rf_preds = self.df["RF_Prediction"].values
         self.prices = self.df["Close"].values
-        self.targets = self.df["Target_Return"].values
         self.max_steps = len(df) - 1
 
     def reset(self, start_index=0):
@@ -157,57 +153,74 @@ class TradingEnvFast:
         return self._get_observation()
 
     def _get_observation(self):
-        # Acceso directo a arrays de Numpy (C++ speed)
-        obs = self.obs_data[self.n_step]  # Features técnicos
-        rf_pred = self.rf_preds[self.n_step]  # Predicción pre-calculada
+        # 1. Obtenemos los features técnicos originales
+        obs = self.obs_data[self.n_step].copy()
+        rf_pred = self.rf_preds[self.n_step]
+
+        # --- NORMALIZACIÓN DE INPUTS (CRÍTICO PARA QUE APRENDA) ---
+        # Asumimos orden: [Return_1d, Return_5d, Dist_SMA_10, Volatility, RSI]
+
+        # RSI (0-100) -> Lo pasamos a (0-1)
+        # Si RSI es la última columna (indice -1 o 4)
+        obs[-1] = obs[-1] / 100.0
+
+        # Distancia SMA (ej. 1.05) -> Centramos en 0 (ej. 0.05)
+        # Si es la columna 2
+        obs[2] = obs[2] - 1.0
+
+        # Volatilidad (ej. 50 pesos) -> Es difícil normalizar sin contexto,
+        # pero podemos dividir por el precio actual aproximado o usar log.
+        # Por ahora, una división simple por 1000 ayuda a que no explote.
+        obs[3] = obs[3] / 1000.0
+
+        # RF Prediction es pequeño, lo amplificamos un poco para que la red lo "vea" bien
+        rf_pred = rf_pred * 10.0
 
         has_shares = 1.0 if self.shares_held > 0 else 0.0
 
         extra_info = np.array([rf_pred, has_shares])
-
         state = np.concatenate((obs, extra_info))
+
         return torch.FloatTensor(state)
 
     def step(self, action):
         current_price = self.prices[self.n_step]
-        current_rf_pred = self.rf_preds[self.n_step]  # Guardamos la predicción actual
 
-        if action == 1:  # Comprar
+        # Ejecutar Acción
+        if action == 1:  # BUY
             if self.balance >= current_price:
+                # Comprar todo lo posible (Simplificación agresiva para forzar movimientos)
                 shares_to_buy = self.balance // current_price
                 self.balance -= shares_to_buy * current_price
                 self.shares_held += shares_to_buy
 
-        elif action == 2:  # Vender
+        elif action == 2:  # SELL
             if self.shares_held > 0:
                 self.balance += self.shares_held * current_price
                 self.shares_held = 0
 
+        # Avanzar el tiempo
         self.n_step += 1
-
         next_price = self.prices[self.n_step]
+
+        # Calcular Patrimonio Nuevo
         self.net_worth = self.balance + (self.shares_held * next_price)
         self.net_worth_history.append(self.net_worth)
 
-        prev_net_worth = self.net_worth_history[-2]
-        reward = (self.net_worth - prev_net_worth) / prev_net_worth
-        reward = reward * 100
+        # --- CÁLCULO DE RECOMPENSA (ALPHA) ---
 
-        # Penalización por HOLD cuando hay oportunidades claras
-        if action == 0:  # HOLD
-            # Si hay una señal fuerte (positiva o negativa) y no actuamos, penalizamos
-            if abs(current_rf_pred) > 0.01:  # Señal significativa (>1%)
-                # Pequeña penalización por inactividad cuando hay oportunidad
-                reward -= (
-                    0.005  # -0.5% de penalización (reducida para no ser muy agresiva)
-                )
-            # Si no tenemos acciones y el mercado sube, también penalizamos ligeramente
-            if self.shares_held == 0 and next_price > current_price:
-                market_return = (next_price - current_price) / current_price
-                reward -= market_return * 20  # Penalización proporcional reducida
+        # 1. Retorno del Agente
+        prev_net_worth = self.net_worth_history[-2]
+        agent_return = (self.net_worth - prev_net_worth) / prev_net_worth
+
+        # 2. Retorno del Mercado (Benchmark)
+        market_return = (next_price - current_price) / current_price
+
+        # 3. Alpha (Diferencia)
+        # Multiplicamos por 100 para que los gradientes de la red neuronal sean significativos
+        reward = (agent_return - market_return) * 100
 
         done = self.n_step >= (self.max_steps - 1)
-
         next_state = (
             self._get_observation()
             if not done
@@ -405,14 +418,14 @@ for tr in tries:
             print(f"Error: {e}")
 
     try:
-        agent.save(f"modelo_trader_{tr}.pth")
+        agent.save(f"modelo_trader_alpha_{tr}.pth")
 
         # --- USAR AL FINAL DEL ENTRENAMIENTO ---
         TOKEN = "8208409663:AAFgU_1DsRBan3lpBu4YcGx_50uqx0GiSEo"  # Pega lo que te dio BotFather
         CHAT_ID = "6912858224"  # Pega tu ID numérico
 
-        enviar_a_telegram(f"modelo_trader_{tr}.pth", TOKEN, CHAT_ID)
+        enviar_a_telegram(f"modelo_trader_alpha_{tr}.pth", TOKEN, CHAT_ID)
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        print(f"Modelo enviado exitosamente en: modelo_trader_{tr}.pth")
+        print(f"Modelo enviado exitosamente en: modelo_trader_alpha_{tr}.pth")

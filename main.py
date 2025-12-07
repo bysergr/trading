@@ -170,6 +170,7 @@ class TradingEnvFast:
 
     def step(self, action):
         current_price = self.prices[self.n_step]
+        current_rf_pred = self.rf_preds[self.n_step]  # Guardamos la predicción actual
 
         if action == 1:  # Comprar
             if self.balance >= current_price:
@@ -191,6 +192,19 @@ class TradingEnvFast:
         prev_net_worth = self.net_worth_history[-2]
         reward = (self.net_worth - prev_net_worth) / prev_net_worth
         reward = reward * 100
+
+        # Penalización por HOLD cuando hay oportunidades claras
+        if action == 0:  # HOLD
+            # Si hay una señal fuerte (positiva o negativa) y no actuamos, penalizamos
+            if abs(current_rf_pred) > 0.01:  # Señal significativa (>1%)
+                # Pequeña penalización por inactividad cuando hay oportunidad
+                reward -= (
+                    0.005  # -0.5% de penalización (reducida para no ser muy agresiva)
+                )
+            # Si no tenemos acciones y el mercado sube, también penalizamos ligeramente
+            if self.shares_held == 0 and next_price > current_price:
+                market_return = (next_price - current_price) / current_price
+                reward -= market_return * 20  # Penalización proporcional reducida
 
         done = self.n_step >= (self.max_steps - 1)
 
@@ -228,8 +242,8 @@ class Agent:
         self.memory = deque(maxlen=2000)
 
         self.epsilon = 1.0  # Exploración inicial
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.1  # Aumentado para mantener más exploración
+        self.epsilon_decay = 0.998  # Más lento para mantener exploración más tiempo
         self.gamma = 0.95  # Factor de descuento
         self.batch_size = 32
 
@@ -275,10 +289,15 @@ class Agent:
             self.optimizer.step()
             total_loss += loss.item()
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+        # NO reducimos epsilon aquí - lo haremos al final de cada episodio
+        # Esto evita que el epsilon caiga demasiado rápido
 
         return total_loss / self.batch_size
+
+    def decay_epsilon(self):
+        """Reduce epsilon al final de cada episodio"""
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
 
     def update_target_network(self):
         self.target_model.load_state_dict(self.model.state_dict())
@@ -302,7 +321,7 @@ features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
 state_dim = len(features_rf) + 2
 action_dim = 3  # Hold, Buy, Sell
 
-tries = [2, 200, 150, 100, 300]
+tries = [50, 100]
 for tr in tries:
     agent = Agent(state_dim, action_dim)
     episodes = tr  # Aumentar para mejor resultado (ej. 200)
@@ -326,6 +345,7 @@ for tr in tries:
 
         total_reward = 0
         done = False
+        action_counts = {0: 0, 1: 0, 2: 0}  # Para monitorear acciones
 
         with tqdm(
             total=env.max_steps,
@@ -334,6 +354,7 @@ for tr in tries:
         ) as pbar:
             while not done:
                 action = agent.act(state, is_training=True)
+                action_counts[action] += 1
                 next_state, reward, done = env.step(action)
                 agent.remember(state, action, reward, next_state, done)
                 state = next_state
@@ -343,15 +364,22 @@ for tr in tries:
 
                 pbar.update(1)
 
-                # Muestra el Profit acumulado y el Epsilon actual
+                # Muestra el Profit acumulado, Epsilon y distribución de acciones
                 pbar.set_postfix(
-                    {"Profit": f"{total_reward:.1f}%", "Eps": f"{agent.epsilon:.2f}"}
+                    {
+                        "Profit": f"{total_reward:.1f}%",
+                        "Eps": f"{agent.epsilon:.2f}",
+                        "Actions": f"H:{action_counts[0]} B:{action_counts[1]} S:{action_counts[2]}",
+                    }
                 )
+
+        # Reducir epsilon al final del episodio (no en cada batch)
+        agent.decay_epsilon()
 
         if e % 5 == 0:
             agent.update_target_network()
             print(
-                f"Episodio {e}/{episodes} | Ticker: {ticker_train} | Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.2f}"
+                f"Episodio {e}/{episodes} | Ticker: {ticker_train} | Reward: {total_reward:.2f} | Epsilon: {agent.epsilon:.2f} | Acciones: HOLD={action_counts[0]}, BUY={action_counts[1]}, SELL={action_counts[2]}"
             )
 
     print("\nEntrenamiento finalizado.")

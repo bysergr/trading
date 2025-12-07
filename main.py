@@ -14,14 +14,20 @@ import joblib
 
 
 # --- CONFIGURACIÓN ---
-tickers_bvc = ["ECOPETROL.CL", "ISA.CL", "GRUPOARGOS.CL", "GEB.CL"]
+tickers_bvc = [
+    "ECOPETROL.CL",
+    "ISA.CL",
+    "GRUPOARGOS.CL",
+    "GEB.CL",
+    "CEMARGOS.CL",
+    "GRUPOSURA.CL",
+    "PFAVAL.CL",
+]
 FECHA_CORTE = "2023-12-31"  # El modelo NO verá nada después de esta fecha para entrenar
 features_rf = ["Return_1d", "Return_5d", "Dist_SMA_10", "Volatility", "RSI"]
 # Estado = Features RF + Prediccion_RF + Has_Shares + Unrealized_PNL = 5 + 1 + 1 + 1 = 8 inputs
 state_dim = len(features_rf) + 3
 action_dim = 3  # Hold, Buy, Sell
-
-tries = [50, 100]
 
 
 # --- FUNCIONES (Mismas del modelo avanzado) ---
@@ -230,6 +236,9 @@ class TradingEnvFast:
         trade_pnl_realized = 0.0
         did_sell = False
 
+        COMISION = 0.0015
+        costo_comision = 0.0
+
         # --- 1. EJECUCIÓN DE ACCIONES ---
         if action == 1:  # BUY
             if self.balance >= current_price:
@@ -237,13 +246,17 @@ class TradingEnvFast:
                 if shares_to_buy > 0:
                     total_cost = shares_to_buy * current_price
 
+                    comision_compra = total_cost * COMISION
+                    costo_comision += comision_compra
+
                     # Actualizar precio promedio ponderado
                     current_val = self.shares_held * self.avg_buy_price
                     new_val = current_val + total_cost
                     self.shares_held += shares_to_buy
                     self.avg_buy_price = new_val / self.shares_held
 
-                    self.balance -= total_cost
+                    # Descontamos costo Y comisión
+                    self.balance -= total_cost + comision_compra
 
         elif action == 2:  # SELL
             if self.shares_held > 0:
@@ -254,10 +267,16 @@ class TradingEnvFast:
                         current_price - self.avg_buy_price
                     ) / self.avg_buy_price
 
+                ingreso_bruto = self.shares_held * current_price
+
+                comision_venta = ingreso_bruto * COMISION
+                costo_comision += comision_venta
+
                 # 2. Ejecutamos la venta
-                self.balance += self.shares_held * current_price
+                self.balance += ingreso_bruto - comision_venta
+
                 self.shares_held = 0
-                self.avg_buy_price = 0.0  # Aquí se vuelve 0, por eso fallaba antes
+                self.avg_buy_price = 0.0
                 did_sell = True
 
         # --- 2. AVANZAR TIEMPO ---
@@ -276,6 +295,26 @@ class TradingEnvFast:
         market_return = (next_price - current_price) / current_price
 
         reward = (agent_return - market_return) * 100
+
+        daily_change_pct = (next_price - current_price) / current_price
+
+        if self.shares_held > 0:
+            UMBRAL_RUIDO = -0.002
+
+            if daily_change_pct < UMBRAL_RUIDO:
+                # La caída es FUERTE (mayor a la comisión), aquí sí castigamos
+                # Hacemos el castigo proporcional a la caída para que le duela más si cae más
+                reward -= 1.0
+
+            if self.avg_buy_price > 0:
+                current_drawdown = (
+                    current_price - self.avg_buy_price
+                ) / self.avg_buy_price
+                if current_drawdown < -0.03:  # Stop loss mental del 3%
+                    reward -= 1.5  # Castigo severo: "¡Corta las pérdidas ya!"
+
+        if costo_comision > 0:
+            reward -= 0.1
 
         # B. Castigo por aguantar pérdidas (Stop Loss implícito)
         if self.shares_held > 0 and next_price < current_price:
@@ -345,10 +384,10 @@ class Agent:
         self.memory = deque(maxlen=2000)
 
         self.epsilon = 1.0
-        self.epsilon_min = 0.05
-        self.epsilon_decay = 0.98
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.99
         self.gamma = 0.95
-        self.batch_size = 32
+        self.batch_size = 64
 
     def act(self, state, is_training=True):
         if is_training and np.random.rand() <= self.epsilon:
@@ -403,7 +442,7 @@ class Agent:
 
 # 1. Definimos las metas acumulativas
 # El modelo entrenará hasta llegar al 50, parará, enviará, y seguirá hasta el 100, etc.
-metas_episodios = [50, 100, 150, 200]
+metas_episodios = [100, 200, 300]
 
 # 2. Inicializamos el agente UNA SOLA VEZ fuera del bucle
 print("\n--- Inicializando Agente (Cerebro Nuevo) ---")

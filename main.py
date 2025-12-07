@@ -226,67 +226,77 @@ class TradingEnvFast:
     def step(self, action):
         current_price = self.prices[self.n_step]
 
-        # Ejecutar Acción
+        # Variable para recordar si vendimos bien en este paso
+        trade_pnl_realized = 0.0
+        did_sell = False
+
+        # --- 1. EJECUCIÓN DE ACCIONES ---
         if action == 1:  # BUY
             if self.balance >= current_price:
                 shares_to_buy = self.balance // current_price
+                if shares_to_buy > 0:
+                    total_cost = shares_to_buy * current_price
 
-                total_cost = shares_to_buy * current_price
+                    # Actualizar precio promedio ponderado
+                    current_val = self.shares_held * self.avg_buy_price
+                    new_val = current_val + total_cost
+                    self.shares_held += shares_to_buy
+                    self.avg_buy_price = new_val / self.shares_held
 
-                current_value_held = self.shares_held * self.avg_buy_price
-                new_value = current_value_held + total_cost
-                self.shares_held += shares_to_buy
-                self.avg_buy_price = new_value / self.shares_held
-
-                self.balance -= total_cost
+                    self.balance -= total_cost
 
         elif action == 2:  # SELL
             if self.shares_held > 0:
+                # --- CORRECCIÓN AQUÍ ---
+                # 1. Calculamos el PnL ANTES de borrar el precio promedio
+                if self.avg_buy_price > 0:
+                    trade_pnl_realized = (
+                        current_price - self.avg_buy_price
+                    ) / self.avg_buy_price
+
+                # 2. Ejecutamos la venta
                 self.balance += self.shares_held * current_price
                 self.shares_held = 0
+                self.avg_buy_price = 0.0  # Aquí se vuelve 0, por eso fallaba antes
+                did_sell = True
 
-            self.avg_buy_price = 0.0
-
-        # Avanzar el tiempo
+        # --- 2. AVANZAR TIEMPO ---
         self.n_step += 1
         next_price = self.prices[self.n_step]
 
-        # Calcular Patrimonio Nuevo
+        # Calcular Patrimonio
         self.net_worth = self.balance + (self.shares_held * next_price)
         self.net_worth_history.append(self.net_worth)
 
-        # --- CÁLCULO DE RECOMPENSA (ALPHA) ---
+        # --- 3. CÁLCULO DE RECOMPENSA ---
 
-        # 1. Retorno del Agente
+        # A. Retornos Básicos
         prev_net_worth = self.net_worth_history[-2]
         agent_return = (self.net_worth - prev_net_worth) / prev_net_worth
-
-        # 2. Retorno del Mercado (Benchmark)
         market_return = (next_price - current_price) / current_price
 
-        # --- CÁLCULO DE RECOMPENSA MEJORADO ---
-
-        # 1. Recompensa Base (Alpha vs Mercado)
         reward = (agent_return - market_return) * 100
 
-        # 2. CASTIGO POR HOLDING EN BAJADA (Stop Loss implícito)
-        # Si tiene acciones y el precio bajó respecto a ayer, castigo extra
+        # B. Castigo por aguantar pérdidas (Stop Loss implícito)
         if self.shares_held > 0 and next_price < current_price:
             reward -= 0.5
 
-        # 3. PREMIO POR VENDER CON GANANCIA (Take Profit)
-        # Si vendió (action==2) y sacó ganancia respecto a su precio de compra
-        if action == 2 and self.shares_held == 0:  # Acaba de vender
-            # Calculamos retrospectivamente si fue buena venta
-            pnl_venta = (current_price - self.avg_buy_price) / self.avg_buy_price
-            if pnl_venta > 0.01:  # Si ganó más del 1%
-                reward += 2.0  # ¡Gran premio!
+        # C. Premio por Venta Exitosa (Usamos la variable temporal trade_pnl_realized)
+        if did_sell and trade_pnl_realized > 0.01:  # Si ganó > 1%
+            reward += 2.0  # Gran premio
+        elif did_sell and trade_pnl_realized < -0.02:  # Si vendió con mucha perdida
+            reward -= 1.0  # Castigo extra por dejarla caer tanto
 
-        # 4. Castigo por inactividad si no tiene acciones y el mercado sube (FOMO)
-        if self.shares_held == 0 and market_return > 0.01:
+        # D. Castigo por inactividad (FOMO)
+        if self.shares_held == 0 and market_return > 0.015:
             reward -= 0.5
 
+        if agent_return < 0:
+            reward -= 1.0
+
         done = self.n_step >= (self.max_steps - 1)
+
+        # Al obtener la observación siguiente, recuerda que avg_buy_price ya puede ser 0
         next_state = (
             self._get_observation()
             if not done
